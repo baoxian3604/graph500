@@ -279,9 +279,7 @@ SOATTR int aml_init( int *argc, char ***argv ) {
 		if(n>0 && strcmp(host_names[n-1], host_names[n])) color++;
 		if(strcmp(host_name, host_names[n]) == 0) break;
 	}
-		if(myproc==num_procs-1)for (int n=0; n<num_procs; n++)  {
-		printf("%s\n",host_names[n]);
-	}
+	
 	free(host_names);
 	MPI_Comm_split(MPI_COMM_WORLD, color, myproc, &comm_intra);
 

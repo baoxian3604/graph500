@@ -12,8 +12,9 @@
 // transparent message aggregation greatly increases message-rate for loosy interconnects
 // shared memory optimization used
 // Implementation basic v1.0
-
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -130,20 +131,27 @@ static void process_intra(int fromlocal,int length ,char* message) {
 }
 
 // poll intranode message
+const int one=1;
 inline void aml_poll_intra(void) {
 	int flag, from, length,index;
 	MPI_Status status;
 	MPI_Testany( NRECV_intra,rqrecv_intra, &index, &flag, &status );
 	if ( flag ) {
 		MPI_Get_count( &status, MPI_CHAR, &length );
-		ack_intra -= status.MPI_TAG;
+		if(length>0){
+			ack_intra -= *(int *)(recvbuf_intra +AGGR_intra*index);
+			length-=sizeof(int);
+		}
 		if(length>0) { //no confirmation & processing for ack only messages
 			from = status.MPI_SOURCE;
-			if(inbarrier)
-				MPI_Send(NULL, 0, MPI_CHAR,from, 1, comm_intra); //ack now
+			if(inbarrier){
+				MPI_Send(&one, 4, MPI_CHAR,from, 1, comm_intra); //ack now
+			}
 			else
+			{
 				acks_intra[from]++; //normally we have delayed ack
-			process_intra( from, length,recvbuf_intra +AGGR_intra*index);
+			}
+			process_intra( from, length,recvbuf_intra +AGGR_intra*index+sizeof(int));
 		}
 		MPI_Start( rqrecv_intra+index);
 	}
@@ -158,15 +166,18 @@ static void aml_poll(void) {
 	MPI_Testany( NRECV,rqrecv,&index, &flag, &status );
 	if ( flag ) {
 		MPI_Get_count( &status, MPI_CHAR, &length );
-		ack -= status.MPI_TAG;
 		nbytes_rcvd+=length;
+		if(length>0){
+			ack -= *(int *)(recvbuf +AGGR_intra*index);
+			length-=sizeof(int);
+		}
 		if(length>0) { //no confirmation & processing for ack only messages
 			from = status.MPI_SOURCE;
 			if(inbarrier)
-				MPI_Send(NULL, 0, MPI_CHAR,from, 1, comm); //ack now
+				MPI_Send(&one, 1, MPI_INT,from, 1, comm); //ack now
 			else
 				acks[from]++; //normally we have delayed ack
-			process( from, length,recvbuf+AGGR*index );
+			process( from, length,recvbuf+AGGR*index+sizeof(int) );
 		}
 		MPI_Start( rqrecv+index );
 	}
@@ -181,10 +192,11 @@ inline void flush_buffer( int node ) {
 		aml_poll();
 		MPI_Testany(NSEND,rqsend,&index,&flag,&stsend);
 	}
-	MPI_Isend(SENDSOURCE(node), sendsize[node], MPI_CHAR,node, acks[node], comm, rqsend+index );
+	((int *)(SENDSOURCE(node)))[0]=acks[node];
+	MPI_Isend(SENDSOURCE(node), sendsize[node], MPI_CHAR,node, node, comm, rqsend+index );
 	nbytes_sent+=sendsize[node];
-	if (sendsize[node] > 0) ack++;
-	sendsize[node] = 0;
+	if (sendsize_intra[node] > sizeof(int)) ack++;
+	sendsize[node] = sizeof(int);
 	acks[node] = 0;
 	tmp=activebuf[index]; activebuf[index]=nbuf[node]; nbuf[node]=tmp; //swap bufs
 
@@ -198,10 +210,11 @@ inline void flush_buffer_intra( int node ) {
 		aml_poll_intra();
 		MPI_Testany(NSEND_intra,rqsend_intra,&index,&flag,&stsend);
 	}
+	((int *)(SENDSOURCE_intra(node)))[0]=acks_intra[node];
 	MPI_Isend( SENDSOURCE_intra(node), sendsize_intra[node], MPI_CHAR,
-			node, acks_intra[node], comm_intra, rqsend_intra+index );
-	if (sendsize_intra[node] > 0) ack_intra++;
-	sendsize_intra[node] = 0;
+			node, node, comm_intra, rqsend_intra+index );
+	if (sendsize_intra[node] > sizeof(int)) ack_intra++;
+	sendsize_intra[node] = sizeof(int);
 	acks_intra[node] = 0;
 	tmp=activebuf_intra[index]; activebuf_intra[index]=nbuf_intra[node]; nbuf_intra[node]=tmp; //swap bufs
 
@@ -222,7 +235,6 @@ inline void aml_send_intra(void *src, int type, int length, int local, int from)
 
 	memcpy(dst+sizeof(struct hdri),src,length);
 }
-
 SOATTR void aml_send(void *src, int type,int length, int node ) {
 	if ( node == myproc )
 		return aml_handlers[type](myproc,src,length);
@@ -352,7 +364,7 @@ SOATTR int aml_init( int *argc, char ***argv ) {
 	nbuf_intra = (short unsigned int*)malloc( group_size*sizeof(*nbuf_intra) );
 	if (!nbuf_intra) return -1;
 	for ( j = 0; j < group_size; j++ ) {
-		sendsize_intra[j] = 0; nbuf_intra[j] = j; acks_intra[j]=0;
+		sendsize_intra[j] = sizeof(int); nbuf_intra[j] = j; acks_intra[j]=0;
 	}
 	for(i=0;i<NRECV_intra;i++)
 		MPI_Start(rqrecv_intra+i);
@@ -363,7 +375,7 @@ SOATTR int aml_init( int *argc, char ***argv ) {
 	}
 
 	for ( j = 0; j < num_groups; j++ ) {
-		sendsize[j] = 0; nbuf[j] = j;  acks[j]=0;
+		sendsize[j] = sizeof(int); nbuf[j] = j;  acks[j]=0;
 	}
 	for(i=0;i<NRECV;i++)
 		MPI_Start( rqrecv+i );
@@ -373,7 +385,125 @@ SOATTR int aml_init( int *argc, char ***argv ) {
 	}
 	return 0;
 }
+#define NBUFS 4
+#define NBUFR 4
+#define BUFSIZE 1024*32
+typedef struct pml_thread{
+	int size;
+	int rank;
+	void *arg;
+	pthread_t *tid;
+	char *buf;
+	MPI_Request req[NBUFR];
+	pthread_barrier_t *barrierp;
+}pml_thread;
+#define BUF_OF(buf,i) (((char *)(buf))+BUFSIZE*i)
+typedef struct pml_comm{
+	int parse;//0,creating thread;1, all thread created
+	int size;
+	pthread_t *tids;
+	pml_thread *pths;
+	char *glob_rbuf;
+	pthread_barrier_t barrier;
+	pthread_mutex_t mutex;
+}pml_comm;
+pml_comm glob_comm;
+MPI_Comm pml_comm_intra;
+SOATTR int pml_comm_create(int size,void*(*entry)(void* p),void **arg,pml_comm *comm){
+	glob_comm.size=size;
+	glob_comm.parse=0;
+	pthread_mutex_init(&glob_comm.mutex, NULL); 
+	glob_comm.tids=(pthread_t *)malloc(sizeof(pthread_t)*size);
+	glob_comm.pths=(pml_thread *)malloc(sizeof(pml_thread)*size);
+	glob_comm.glob_rbuf=(char *)malloc(BUFSIZE*size*NBUFR);
+	pml_thread *pths=glob_comm.pths;
+	MPI_Comm_split(comm_intra, 0, myproc, &pml_comm_intra);
+	pthread_attr_t attr;
+	
+	pthread_barrier_init(&glob_comm.barrier,NULL,size);
+	int r;
+	cpu_set_t cpuset;
+	 
+	for(int i=0;i<size;i++){
+		pths[i].size=size;
+		pths[i].rank=size*myproc+i;
+		if(arg)pths[i].arg=arg[i];
+		else pths[i].arg=NULL;
+		pths[i].tid=&(glob_comm.tids[i]);
+		pths[i].buf=BUF_OF(glob_comm.glob_rbuf,i*NBUFR);
+		pths[i].barrierp=&(glob_comm.barrier);
+		for(int j=0;j<NBUFR;j++){
+			r = MPI_Recv_init( BUF_OF(pths[i].buf,j), BUFSIZE, MPI_CHAR,MPI_ANY_SOURCE, pths[i].rank, pml_comm_intra,pths[i].req+j );
+			if ( r != MPI_SUCCESS ) return r;
+		}
+		pthread_attr_init(&attr);
+		CPU_ZERO(&cpuset);
+		CPU_SET(pths[i].rank,&cpuset);
+		pthread_attr_setaffinity_np(&attr, sizeof(cpuset), &cpuset);
+		pthread_create(&glob_comm.tids[i],&attr,entry,&pths[i]);
+		
+	}
+	
+	glob_comm.parse=1;
+	if(comm)*comm=glob_comm;
+	return 0;
+}
 
+static __thread int thread_rank;
+SOATTR int pml_init(){
+	thread_rank=glob_comm.size*num_procs+pthread_self();
+	return thread_rank;
+}
+SOATTR void pml_wait(pml_comm *comm){
+	glob_comm.parse=2;
+	for(int i=0;i<comm->size;i++){
+		pthread_join(comm->tids[i],NULL);
+	}
+	glob_comm.parse=0;
+}
+SOATTR void pml_send(void *src, int type,int length, int node ) {
+	if ( node == thread_rank )
+		return aml_handlers[type](myproc,src,length);
+	else aml_send(src,type,length,node);
+}
+volatile int sync1=0,sync2=0;
+SOATTR int pml_barrier( void ) {
+	int __pthread_num=glob_comm.size;
+	while(sync2>=__pthread_num){aml_poll();};
+	int r;
+	if(__pthread_num==__sync_add_and_fetch(&sync1,1)){
+		sync1=0;
+		aml_barrier();
+		if(__pthread_num==1)return 0;
+		r=__sync_fetch_and_add(&sync2,__pthread_num);
+	}else {
+		__sync_fetch_and_add(&sync2,1);
+		while(sync2<__pthread_num){aml_poll();};
+		r=__sync_fetch_and_sub(&sync2,1);
+		if((r-1)%__pthread_num==0){
+			__sync_sub_and_fetch(&sync2,__pthread_num);
+		}
+	}
+	return r;
+}
+volatile int __sync3=0;
+volatile int __sum=0;
+SOATTR int pml_long_allsum(int n){
+	__sync_fetch_and_add(&__sum,n);
+	pthread_barrier_wait(&glob_comm.barrier);
+	if(pthread_mutex_trylock(&glob_comm.mutex)==0){
+		MPI_Allreduce(MPI_IN_PLACE,&__sum,1,MPI_INT,MPI_SUM,MPI_COMM_WORLD);
+		pthread_barrier_wait(&glob_comm.barrier);
+		pthread_mutex_unlock(&glob_comm.mutex);
+	}else 
+	pthread_barrier_wait(&glob_comm.barrier);
+	int r=__sum;
+	if(__sync_add_and_fetch(&__sync3,1)==glob_comm.size){
+		__sync_sub_and_fetch(&__sum,r);
+		__sync3=0;
+	}
+	return r;
+}
 SOATTR void aml_barrier( void ) {
 	int i,flag;
 	MPI_Request hndl;

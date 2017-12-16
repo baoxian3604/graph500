@@ -64,24 +64,22 @@ void relaxhndl(int from, void* dat, int sz) {
 //Sending relaxation active message
 void send_relax(int64_t glob, float weight,int fromloc) {
 	relaxmsg m = {weight,VERTEX_LOCAL(glob),fromloc};
-	aml_send(&m,1,sizeof(relaxmsg),VERTEX_OWNER(glob));
+	pml_send(&m,1,sizeof(relaxmsg),VERTEX_OWNER(glob));
 }
-
-void run_sssp(int64_t root,int64_t* pred,float *dist) {
-
+int rt;
+void *entry(void *arg){
+	pml_init();
 	unsigned int i,j;
 	long sum=0;
 
 	float delta = 0.1;
 	glob_mindelta=0.0;
 	glob_maxdelta=delta;
-	glob_dist=dist;
 	weights=g.weights;
-	pred_glob=pred;
 	qc=0;q2c=0;
-
-	aml_register_handler(relaxhndl,1);
-
+	float *dist=glob_dist;
+	int64_t* pred=pred_glob;
+	int root=rt;
 	if (VERTEX_OWNER(root) == my_pe()) {
 		q1[0]=VERTEX_LOCAL(root);
 		qc=1;
@@ -89,7 +87,7 @@ void run_sssp(int64_t root,int64_t* pred,float *dist) {
 		pred[VERTEX_LOCAL(root)]=root;
 	}
 
-	aml_barrier();
+	pml_barrier();
 	sum=1;
 
 	int64_t lastvisited=1;
@@ -102,19 +100,19 @@ void run_sssp(int64_t root,int64_t* pred,float *dist) {
 		while(sum!=0) {
 			CLEAN_VISITED();
 			lightphase=1;
-			aml_barrier();
+			pml_barrier();
 			for(i=0;i<qc;i++)
 				for(j=rowstarts[q1[i]];j<rowstarts[q1[i]+1];j++)
 					if(weights[j]<delta)
 						send_relax(COLUMN(j),dist[q1[i]]+weights[j],q1[i]);
-			aml_barrier();
+			pml_barrier();
 
 			qc=q2c;q2c=0;int *tmp=q1;q1=q2;q2=tmp;
 			sum=qc;
-			aml_long_allsum(&sum);
+			sum=pml_long_allsum(sum);
 		}
 		lightphase=0;
-		aml_barrier();
+		pml_barrier();
 
 		//2. iterate over S and heavy edges
 		for(i=0;i<g.nlocalverts;i++)
@@ -123,7 +121,7 @@ void run_sssp(int64_t root,int64_t* pred,float *dist) {
 					if(weights[j]>=delta)
 						send_relax(COLUMN(j),dist[i]+weights[j],i);
 			}
-		aml_barrier();
+		pml_barrier();
 
 		glob_mindelta=glob_maxdelta;
 		glob_maxdelta+=delta;
@@ -137,15 +135,25 @@ void run_sssp(int64_t root,int64_t* pred,float *dist) {
 				if (dist[i] < glob_maxdelta)
 					q1[qc++]=i; //this is lowest bucket
 			} else if(dist[i]!=-1.0) lvlvisited++;
-		aml_long_allsum(&sum);
+		sum=pml_long_allsum(sum);
 #ifdef DEBUGSTATS
 		t0-=aml_time();
-		aml_long_allsum(&lvlvisited);
-		aml_long_allsum(&nbytes_sent);
+		lvlvisited=pml_long_allsum(lvlvisited);
+		nbytes_sent=pml_long_allsum(nbytes_sent);
 		if(!my_pe()) printf("--lvl[%1.2f..%1.2f] visited %lld (total %llu) in %5.2fs, network aggr %5.2fGb/s\n",glob_mindelta,glob_maxdelta,lvlvisited-lastvisited,lvlvisited,-t0,-(double)nbytes_sent*8.0/(1.e9*t0));
 		lastvisited = lvlvisited;
 #endif
 	}
+	return NULL;
+}
+void run_sssp(int64_t root,int64_t* pred,float *dist) {
+	rt=root;
+	glob_dist=dist;
+	pred_glob=pred;
+	aml_register_handler(relaxhndl,1);
+	pml_comm comm;
+	pml_comm_create(1,entry,NULL,&comm);
+	pml_wait(&comm);
 
 }
 

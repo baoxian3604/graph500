@@ -1,1 +1,3 @@
 Hello world
+
+进src以后make，然后一种执行方式mpirun -np 4 ./graph500_reference_bfs_sssp 15

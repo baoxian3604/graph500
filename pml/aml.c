@@ -269,8 +269,8 @@ SOATTR int aml_init( int *argc, char ***argv ) {
 	int r, i, j,tmpmax;
 
 	int provided=-1;
-	r=MPI_Init_thread(argc,argv,MPI_THREAD_MULTIPLE,&provided);
-	if(provided!=MPI_THREAD_MULTIPLE){
+	r=MPI_Init_thread(argc,argv,MPI_THREAD_SERIALIZED,&provided);
+	if(provided!=MPI_THREAD_SERIALIZED){
 		printf("pml init failed\n");
 	}
 	if ( r != MPI_SUCCESS ) return r;
@@ -478,16 +478,18 @@ static void pml_process(int from,int length ,char* message) {
 		i += sizeof(struct hdri) + hsz;
 	}
 }
-//int poll_time=0;
+int __thread poll_time=0;
 #ifndef p2p
 inline void pml_poll(void) {//recev any tag
-	//poll_time++;
+	//if(poll_time%2!=self)return;
+	//else 
+		poll_time++;
 	int flag, from, length,index;
 	static pthread_mutex_t mutex2=PTHREAD_MUTEX_INITIALIZER;
 	MPI_Status status;	
 	//printf("???? %d %d\n",ack_intra,myproc);
 	//printf("!!!!\n");
-	if(pthread_mutex_trylock(&mutex2))return;
+	//if(pthread_mutex_trylock(&mutex2))return;
 	MPI_Testany( NRECV_intra,rqrecv_intra, &index, &flag, &status );
 	if ( flag ) {
 		char *bufhead=recvbuf_intra +AGGR_intra*index;
@@ -509,7 +511,7 @@ inline void pml_poll(void) {//recev any tag
 		}
 		MPI_Start( rqrecv_intra+index);
 	}
-		pthread_mutex_unlock(&mutex2);
+	//	pthread_mutex_unlock(&mutex2);
 }
 #else
 inline void pml_poll(void) {
@@ -522,10 +524,8 @@ inline void pml_poll(void) {
 		if(length>0){
 			__sync_fetch_and_sub(&ack_intra,*(int *)bufhead);
 			length-=sizeof(int);
-			//if(*(int *)bufhead)printf("recv ack=%d from %d\n",*(int *)BUF_OF(glob_comm.pths[self].buf,index),status.MPI_SOURCE);
 		}
-		if(length>0) { //no confirmation & processing for ack only messages
-		////	printf("recv msg in %d from %d inbarrier?%d\n",thread_rank,((struct hdri*)(bufhead+sizeof(int)))->routing,inbarrier);
+		if(length>0) { 
 			from = status.MPI_SOURCE;
 			if(inbarrier){
 				MPI_Send(&one, 4, MPI_CHAR,from, ((struct hdri*)(bufhead+sizeof(int)))->routing, pml_comm_intra); //ack now
@@ -561,8 +561,8 @@ inline void pml_flush_buffer( int group ) {
 	tmp=activebuf_intra[index]; activebuf_intra[index]=nbuf_intra[group]; nbuf_intra[group]=tmp; 
 
 }
-int writing=0;
-//int send_time=0;
+int  writing=0;
+int __thread send_time=0;
 SOATTR void pml_send(void *src, int type,int length, int node ) {
 	//send_time++;
 #ifdef p2p
@@ -598,7 +598,7 @@ SOATTR int pml_barrier( void ) {
 	int __pthread_num=glob_comm.size;
 	while(sync2>=__pthread_num){
 		//pml_poll();
-		sleep(0);
+		//sleep(0);
 		};
 	int r;
 	if(__pthread_num==__sync_add_and_fetch(&sync1,1)){
@@ -624,7 +624,7 @@ SOATTR int pml_barrier( void ) {
 	}else {
 		__sync_fetch_and_add(&sync2,1);
 		while(sync2<__pthread_num){
-			sleep(0);
+			//sleep(0);
 			//pml_poll();
 		};
 		r=__sync_fetch_and_sub(&sync2,1);

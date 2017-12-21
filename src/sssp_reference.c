@@ -40,10 +40,12 @@ typedef struct  __attribute__((__packed__)) relaxmsg {
 	int src_vloc; //local index of source vertex
 } relaxmsg;
 
+extern int __thread poll_time;
+extern int __thread send_time;
 // Active message handler for relaxation
 void relaxhndl(int from, void* dat, int sz) {
 	relaxmsg* m = (relaxmsg*) dat;
-	
+	send_time++;
 	//printf("recv %d->%d\n",VERTEX_TO_GLOBAL(from/2,m->src_vloc),VERTEX_TO_GLOBAL(rank,m->dest_vloc));
 	int vloc = m->dest_vloc;
 	float w = m->w;
@@ -72,11 +74,9 @@ void send_relax(int64_t glob, float weight,int fromloc) {
 	pml_send(&m,1,sizeof(relaxmsg),VERTEX_OWNER(glob));
 }
 int rt;
-//extern int poll_time;
-//extern int send_time;
 void *entry(void *arg){
-	//poll_time=0;
-	//send_time=0;
+	poll_time=0;
+	send_time=0;
 	//printf("1 %f\n",aml_time());
 	pml_init(arg);
 	unsigned int i,j;
@@ -164,7 +164,7 @@ void *entry(void *arg){
 		lastvisited = lvlvisited;
 #endif
 	}
-	//printf("polltime=%d send_time=%d\n",poll_time,send_time);
+	printf("polltime=%d send_time=%d\n",poll_time,send_time);
 	return NULL;
 }
 int __pthread_num=TH_N;

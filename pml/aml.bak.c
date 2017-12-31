@@ -477,12 +477,7 @@ typedef struct pml_comm{
 	pthread_mutex_t mutex;
 }pml_comm;
 pml_comm glob_comm;
-typedef struct bufhead{
-	int group;
-	int sendsize;
-	int writesize;
-	char buf[0];
-}bufhead;
+
 pthread_cond_t cond[32] = {};
 SOATTR int pml_comm_create(int size,void*(*entry)(void* p),void **arg,pml_comm *comm){
 	glob_comm.size=size;
@@ -497,10 +492,9 @@ SOATTR int pml_comm_create(int size,void*(*entry)(void* p),void **arg,pml_comm *
 	int r;
 	cpu_set_t cpuset;
 	for ( int j = 0; j < group_size; j++ ) {
-		((bufhead *)SENDSOURCE_intra(j))->group = j; 
+		((int *)SENDSOURCE_intra(j))[0] = sizeof(int)+sizeof(int); 
 		
-		((bufhead *)SENDSOURCE_intra(j))->sendsize = 0;
-		((bufhead *)SENDSOURCE_intra(j))->writesize = 0;
+		((int *)SENDSOURCE_intra(j))[1] = sizeof(int)+sizeof(int);
 		pthread_cond_init(&cond[j],NULL);
 	}
 	for(int i=0;i<size;i++){
@@ -525,15 +519,9 @@ SOATTR int pml_comm_create(int size,void*(*entry)(void* p),void **arg,pml_comm *
 __thread double starttime;
 __thread int thread_rank;
 __thread int self;
-#define AGGRa 340
-char __thread arrange[32][AGGRa];
-int __thread asize[32]={};
 SOATTR int pml_init(pml_thread *pth){
 	self=pth->rank%pth->size;
 	thread_rank=pth->rank;
-	for(int i=0;i<group_size;i++){
-		asize[i]=0;
-	}
 	return thread_rank;
 }
 SOATTR void pml_wait(pml_comm *comm){
@@ -550,7 +538,7 @@ static void pml_process(int from,int length ,char* message) {
 		struct hdri *h = (struct hdri *)m;
 		int hsz=h->sz;
 		int hndl=h->hndl;
-		if(hndl!=-1)aml_handlers[hndl](from,m+sizeof(struct hdri),hsz);
+		aml_handlers[hndl](h->routing,m+sizeof(struct hdri),hsz);
 		i += sizeof(struct hdri) + hsz;
 	}
 }
@@ -560,7 +548,7 @@ inline void pml_poll(void) {
 	//if(poll_time%2!=self)return;
 	//else 
 	//	poll_time++;
-	int flag=0, from, length,index;
+	int flag, from, length,index;
 	//volatile static pthread_mutex_t mutex2=PTHREAD_MUTEX_INITIALIZER;
 	MPI_Status status;	
 		for(int i=0;i<NRECV_intra;i++){
@@ -573,31 +561,32 @@ inline void pml_poll(void) {
 	
 	//if(MPI_Wtime()-starttime>3.0){printf("at there 3 %d %d %d\n",thread_rank,ack_intra,flag);starttime=MPI_Wtime();}
 	if ( flag ) {
-		char *bh=recvbuf_intra +AGGR_intra*index;
+		char *bufhead=recvbuf_intra +AGGR_intra*index;
 		MPI_Get_count( &status, MPI_CHAR, &length );
 		//uint8_t check=0;
 		//for(int i=0;i<length;i++)check^=bufhead[i];
 		//if(check/3!=status.MPI_TAG)printf("EEEEEEEEEEEEERORORORO %d\n     MPI_TAG=%d %d  !!!!!!\n",length,status.MPI_TAG,check/3);
-		//if(length>0){
-		//	__sync_fetch_and_sub(&ack_intra,*(int *)bufhead);
-		//	length-=sizeof(int);
-		//}
-		__sync_fetch_and_sub(&ack_intra,status.MPI_TAG);
+		if(length>0){
+		//	printf("%d from %d ack:%d-=%d:\n",myproc,status.MPI_SOURCE,ack_intra,*(int *)bufhead);
+			__sync_fetch_and_sub(&ack_intra,*(int *)bufhead);
+			length-=sizeof(int);
+		}
 		if(length>0) { 
 			from = status.MPI_SOURCE;
 			nbytes_rcvd+=length;
 			if(inbarrier){
-				MPI_Send(NULL, 0, MPI_CHAR,from, 
-				1,
-				//((struct hdri*)(bufhead+sizeof(int)))->routing,
+				MPI_Send(&one, 4, MPI_CHAR,from, 
+				//0,
+				((struct hdri*)(bufhead+sizeof(int)))->routing,
 				comm_intra); //ack now
+			//	printf("%d send a acks to %d\n",myproc,from);
 			}
 			else
 			{
 				__sync_fetch_and_add(&acks_intra[from],1); //normally we have delayed ack
 			//	printf("%d acks[%d]++=%d\n",myproc,from,acks_intra[from]);
 			}
-			pml_process( from, length,bh);
+			pml_process( 0, length,bufhead+sizeof(int));
 		}
 		MPI_Start( rqrecv_intra+index);
 		pthread_mutex_unlock(&recv_mutex[index]);
@@ -610,8 +599,8 @@ inline void pml_flush_buffer( int group ) {
 	}
 	MPI_Status stsend;
 	int flag=0,index,tmp;
-	bufhead *buffer = SENDSOURCE_intra(group);
-	if (buffer->sendsize == 0&& acks_intra[group]==0 ){
+	char *buffer = SENDSOURCE_intra(group);
+	if (((int *)SENDSOURCE_intra(group))[0] <= sizeof(int)+sizeof(int)&& acks_intra[group]==0 ){
 		pthread_mutex_unlock(&mutexSend);
 		return;
 	}
@@ -620,7 +609,7 @@ inline void pml_flush_buffer( int group ) {
 	if(MPI_Wtime()-starttime>3.0){printf("at there 5 %d %d\n",thread_rank,ack_intra);starttime=MPI_Wtime();}
 		MPI_Testany(NSEND_intra,rqsend_intra,&index,&flag,&stsend);
 	}
-	int acks_ret=__sync_lock_test_and_set(&acks_intra[group],0);
+	((int *)buffer)[1]=__sync_lock_test_and_set(&acks_intra[group],0);
 	//uint8_t check=0;
 	//for(int i=4;i<((int *)buffer)[0];i++){//((int *)buffer)[0]
 	//	check^=buffer[i];
@@ -628,21 +617,17 @@ inline void pml_flush_buffer( int group ) {
 	//}
 	//if (((int *)buffer)[0] > sizeof(int)+sizeof(int))printf("%d:ack++:%d\n",myproc,ack_intra+1);
 	//	printf("%d, send_acks:%d to %d len=%d\n",myproc,((int *)buffer)[1],group,((int *)buffer)[0]-sizeof(int));
-	while(!__sync_bool_compare_and_swap (&(((bufhead *)(SENDSOURCE_intra(group)))->writesize), (((bufhead *)(SENDSOURCE_intra(group)))->sendsize), acks_ret)){sleep(0);}
-	MPI_Isend( buffer->buf, buffer->sendsize, MPI_CHAR,group, 
-	buffer->writesize,
+	MPI_Isend( ((int *)buffer)+1, ((int *)buffer)[0]-sizeof(int), MPI_CHAR,group, 
+	group*glob_comm.size,
 	//check/3,
 	comm_intra, rqsend_intra+index );
-	
-	//nbytes_sent+=((int *)buffer)[0]-sizeof(int)-sizeof(int);
+	nbytes_sent+=((int *)buffer)[0]-sizeof(int)-sizeof(int);
 	//if (sendsize_intra[group] > sizeof(int))printf("myproc=%d %d\n",myproc,group);
-	if (buffer->sendsize > 0) __sync_fetch_and_add(&ack_intra,1);
+	if (((int *)buffer)[0] > sizeof(int)+sizeof(int)) __sync_fetch_and_add(&ack_intra,1);
 	tmp=activebuf_intra[index]; activebuf_intra[index]=nbuf_intra[group]; nbuf_intra[group]=tmp;
-	buffer = SENDSOURCE_intra(group);
-	buffer->group=group;
-	buffer->sendsize=0;
-	buffer->writesize=0;
-	pthread_mutex_unlock(&mutexSend);
+	((int *)SENDSOURCE_intra(group))[0] = sizeof(int)+sizeof(int);
+	((int *)SENDSOURCE_intra(group))[1] = sizeof(int)+sizeof(int);
+	pthread_mutex_unlock(&mutexSend); 
 
 }
 char __thread cac[AGGR_intra];
@@ -663,134 +648,98 @@ void flush_cac(int order){
 	}
 	
 }
-inline void msg_send(void *src ,int length, int group ) {
+SOATTR void pml_send(void *src, int type,int length, int node ) {
 	//send_time++;
 	char* dst;
-#define SENDSOURCE_index(node) ( sendbuf_intra+(AGGR_intra*node) )
-	bufhead *buffer;int ss;
-reread:	
-	buffer	= SENDSOURCE_intra(group);
-	ss = __sync_fetch_and_add(&(buffer->sendsize),length);
+	if(cacsize)flush_cac(Try);
+	if ( node == thread_rank/glob_comm.size )
+		return aml_handlers[type](thread_rank,src,length);
 	
-	//在两步之间，buffer进行了两次交换，已经不是原来的group的buffer了。
-	dst = (buffer->buf)+ss;
+#define SENDSOURCE_index(node) ( sendbuf_intra+(AGGR_intra*node)+sizeof(int) )
+	int group = node;
+	char *buffer = SENDSOURCE_intra(group);
+	int ss = __sync_fetch_and_add(((int *)buffer),sizeof(struct hdri)+length);
+	dst = (buffer+ss);
 	//int nmax = AGGR_intra - sendsize_intra[group] - sizeof(struct hdri);
 	//while(pthread_mutex_trylock(&glob_comm.mutex))sleep(0);
-
-		//double t1;//int flag=0;if(ss>AGGR_intra){//	t1=MPI_Wtime();flag=1;//}
-	while(ss+length>AGGR_intra-sizeof(bufhead)){
-		if(ss>AGGR_intra-sizeof(bufhead)){
-			/*if(in_flushcac==NOT_IN&&cacsize+length<=AGGR_intra){
+	while(ss+sizeof(struct hdri)+length>AGGR_intra){
+		if(ss>AGGR_intra){
+			if(in_flushcac==NOT_IN&&cacsize+sizeof(struct hdri)+length<=AGGR_intra){
 				dst=cac+cacsize;
-				
-				struct hdri *h=(struct hdri *)(dst);
-				length=h->sz;
-				memcpy(dst+length,src,sizeof(struct hdri));
-				h=(struct hdri *)(dst+length);
-				h->routing = group*glob_comm.size;//?
-				memcpy(dst,src+sizeof(struct hdri),length);
+				struct hdri *h=(struct hdri *)(dst+length);
+				h->routing = node;
+				//printf("thread_rank=%d\n",thread_rank);
+				h->sz=length;
+				h->hndl = type;
+				memcpy(dst,src,length);
 				return;
-			}else if(in_flushcac==Try)return;*/
+			}else if(in_flushcac==Try)return;
 			//pthread_mutex_lock(&glob_comm.mutex);
 			//pthread_cond_wait(&cond[group], &glob_comm.mutex);
 			//pthread_mutex_unlock(&glob_comm.mutex);
 			buffer = SENDSOURCE_intra(group);
-			ss = __sync_fetch_and_add(&(buffer->sendsize),length);
-			dst = buffer->buf+ss;
+			ss = __sync_fetch_and_add(((int *)buffer),sizeof(struct hdri)+length);
+			dst = (buffer+ss);
 		}else {
 			MPI_Status stsend;
 			int flag=0,index,tmp;
+			pml_poll();
 	if(MPI_Wtime()-starttime>3.0){printf("at there 8 %d %d\n",thread_rank,ack_intra);starttime=MPI_Wtime();}
 			pthread_mutex_lock(&mutexSend);
-			pml_poll();
 			while (1) {
 				MPI_Testany(NSEND_intra,rqsend_intra,&index,&flag,&stsend);
 				if(flag)break;
 				pml_poll();
 	if(MPI_Wtime()-starttime>3.0){printf("at there 7 %d %d\n",thread_rank,ack_intra);starttime=MPI_Wtime();}
 			}
-			buffer = SENDSOURCE_index(activebuf_intra[index]);
-			buffer->group=group;
-			buffer->sendsize=length;
-			buffer->writesize=0;
+			buffer = sendbuf_intra+(AGGR_intra*activebuf_intra[index]);
+			((int *)buffer)[0]=sizeof(int)+sizeof(int)+length+sizeof(struct hdri);
+			((int *)buffer)[1]=sizeof(int)+sizeof(int);
 			tmp=nbuf_intra[group]; nbuf_intra[group]=activebuf_intra[index]; activebuf_intra[index]=tmp;
 			//pthread_cond_broadcast(&cond[group]);
 			//pthread_mutex_unlock(&glob_comm.mutex);
-			
-			//((int *)(SENDSOURCE_index(tmp)))[0]=__sync_lock_test_and_set(&acks_intra[group],0);
 			int acks_ret=__sync_lock_test_and_set(&acks_intra[group],0);
-			while(!__sync_bool_compare_and_swap (&(((bufhead *)(SENDSOURCE_index(tmp)))->writesize), ss, acks_ret)){sleep(0);};
+			//((int *)(SENDSOURCE_index(tmp)))[0]=
+			while(!__sync_bool_compare_and_swap (((int *)(SENDSOURCE_index(tmp))), ss, acks_ret)){sleep(0);};
 		//uint8_t check=0;
 		//for(int i=0;i<ss-sizeof(int);i++){
 		//	check^=SENDSOURCE_index(tmp)[i];
 		//	if(ss-sizeof(int)>32763)printf("GET IT\n\n\n");
 		//}
 		//	printf("%d:ack++=%d,send_acks:%d to %d\n",myproc,ack_intra+1,acks_ret,group);
-			MPI_Isend( ((bufhead *)(SENDSOURCE_index(tmp)))->buf, ss, MPI_CHAR,group,
+			MPI_Isend( SENDSOURCE_index(tmp), ss-sizeof(int), MPI_CHAR,group,
 			//check/3,
-			acks_ret, 
+			group*glob_comm.size, 
 			comm_intra, rqsend_intra+index );
 		//	printf("send1=%d\n",ss-sizeof(int));
 		//	nbytes_sent+=ss-sizeof(int)-sizeof(int);
-			
-		//	pthread_spin_unlock(&send_mutex[index]);
+
 			pthread_mutex_unlock(&mutexSend);
 			 __sync_fetch_and_add(&ack_intra,1);
-			 ss = length;
-			 dst = buffer->buf;
-			 
+			 ss = sizeof(int)+sizeof(int)+length+sizeof(struct hdri);
+			 dst = SENDSOURCE_intra(group)+sizeof(int)+sizeof(int);
 		}
 	};
-	if(buffer->group!=group){printf("????\n");
-		((struct hdri *)dst)->hndl=-1;
-		((struct hdri *)dst)->sz=length-sizeof(struct hdri);
-		__sync_fetch_and_add(&(buffer->writesize),length);
-		goto reread;
-	}
-	//	if(flag)
-	//		starttime+=MPI_Wtime()-t1;
-	memcpy(dst,src,length);
-	__sync_fetch_and_add(&(buffer->writesize),length);
-end:	
-return;
-}
-SOATTR void pml_send(void *src, int type,int length, int node ){
-	//if(cacsize&&in_flushcac==NOT_IN)flush_cac(Try);
-	if ( node == thread_rank/glob_comm.size )
-		return aml_handlers[type](node,src,length);
-	int group=node;
-	if(sizeof(struct hdri)+length+asize[group]>AGGRa){
-		msg_send(arrange[group],asize[group],group);
-		asize[group]=0;
-	}
-	char *dst=arrange[group]+asize[group];
 	struct hdri *h=(struct hdri *)dst;
 	h->routing = thread_rank;
 	//printf("thread_rank=%d\n",thread_rank);
 	h->sz=length;
 	h->hndl = type;
 	memcpy(dst+sizeof(struct hdri),src,length);
-	asize[group]+=sizeof(struct hdri)+length;
 	if(in_flushcac!=NOT_IN){h=src+length;h->hndl=-1;}
-	if(in_flushcac==Must){msg_send(arrange[group],asize[group],group);asize[group]=0;}
+	__sync_fetch_and_add(((int *)buffer)+1,length+sizeof(struct hdri));
 	
 }
 volatile int sync1=0,sync2=0;
 SOATTR int pml_barrier( void ) {
 	//printf("!!!ack_intra=%d %d %d\n",ack_intra,thread_rank,myproc);
-	//flush_cac(Must);
-	for(int i=0;i<group_size;i++){
-		if(asize[i]){
-			msg_send(arrange[i],asize[i],i);
-			asize[i]=0;
-		}
-	}
+	flush_cac(Must);
 	int __pthread_num=glob_comm.size;
 	while(sync2>=__pthread_num){
 		//pml_poll();
 		sleep(0);
 		};
-	int r=0;
+	int r;
 	if(__pthread_num==__sync_add_and_fetch(&sync1,1)){
 		sync1=0;
 		int i,flag;
@@ -807,26 +756,26 @@ SOATTR int pml_barrier( void ) {
 		while(flag==0) {
 			//printf("loop %d\n",ack_intra);
 			if(MPI_Wtime()-starttime>3.0){printf("at there 4 %d\n",thread_rank);
-			//for(int i=0;i<group_size;i++){printf("%d:acks[%d]=%d\n",thread_rank,i,acks_intra[i]);}
+			for(int i=0;i<group_size;i++){printf("%d:acks[%d]=%d\n",thread_rank,i,acks_intra[i]);}
 			starttime=MPI_Wtime();}
 			MPI_Test(&hndl,&flag,MPI_STATUS_IGNORE); 
-			pml_poll(); 
-		}
+			pml_poll(); }
+
 		inbarrier--;
 		MPI_Barrier(MPI_COMM_WORLD);
 		pthread_barrier_wait(&glob_comm.barrier);
 	//printf("!!!out2=%d %d %d\n",ack_intra,thread_rank,myproc);
-		goto end;
+		return 0;
 		if(__pthread_num==1)
-			goto end;
+			return 0;
 		r=__sync_fetch_and_add(&sync2,__pthread_num);
 	}else {
 		
 		//for(int i=0;i<group_size;i++)pthread_cond_broadcast(&cond[i]);
 		pthread_barrier_wait(&glob_comm.barrier);
-		r=1;
-		goto end;
+		
 	//printf("!!!out=%d %d %d\n",ack_intra,thread_rank,myproc);
+		return 1;
 		__sync_fetch_and_add(&sync2,1);
 		while(sync2<__pthread_num){
 			sleep(0);
@@ -837,7 +786,7 @@ SOATTR int pml_barrier( void ) {
 			__sync_sub_and_fetch(&sync2,__pthread_num);
 		}
 	}
-end:	return r;
+	return r;
 }
 volatile int __sync3=0;
 int __sum=0;

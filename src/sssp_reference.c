@@ -38,51 +38,70 @@ typedef struct  __attribute__((__packed__)) relaxmsg {
 	float w; //weight of an edge
 	int dest_vloc; //local index of destination vertex
 	int src_vloc; //local index of source vertex
+	unsigned check;
 } relaxmsg;
 
 extern int __thread poll_time;
 extern int __thread send_time;
+extern int __thread self;
+extern int __thread thread_rank;
+pthread_mutex_t mt=PTHREAD_MUTEX_INITIALIZER;
 // Active message handler for relaxation
 void relaxhndl(int from, void* dat, int sz) {
+	poll_time++;
+	pthread_mutex_lock(&mt);
 	relaxmsg* m = (relaxmsg*) dat;
-	send_time++;
-	//printf("recv %d->%d\n",VERTEX_TO_GLOBAL(from/2,m->src_vloc),VERTEX_TO_GLOBAL(rank,m->dest_vloc));
+	if(m->check!=(unsigned)((*(unsigned *)&(m->w))^(unsigned)VERTEX_TO_GLOBAL(rank,m->dest_vloc)^m->src_vloc))printf("EEEEEERORORO %u %u :%u %u %u\n",m->check,(unsigned)((*(unsigned *)&(m->w))^(unsigned)VERTEX_TO_GLOBAL(rank,m->dest_vloc)^m->src_vloc),(unsigned)((*(unsigned *)&(m->w))^(unsigned)VERTEX_TO_GLOBAL((rank+1)%size,m->dest_vloc)^m->src_vloc),(unsigned)((*(unsigned *)&(m->w))^(unsigned)VERTEX_TO_GLOBAL((rank+2)%size,m->dest_vloc)^m->src_vloc),(unsigned)((*(unsigned *)&(m->w))^(unsigned)VERTEX_TO_GLOBAL((rank+3)%size,m->dest_vloc)^m->src_vloc));
+	//printf("recv %d->%d from %d->%d\n",VERTEX_TO_GLOBAL(from,m->src_vloc),VERTEX_TO_GLOBAL(rank,m->dest_vloc),from,rank);
 	int vloc = m->dest_vloc;
 	float w = m->w;
+	float Dist = glob_dist[vloc];
 	float *dest_dist = &glob_dist[vloc];
 	//check if relaxation is needed: either new path is shorter or vertex not reached earlier
-	if (*dest_dist < 0 || *dest_dist > w) {
-		*dest_dist = w; //update distance
+	if (Dist < 0 || Dist > w) {
+		int swap = *(int *)dest_dist;
+		*dest_dist=w;
+		
 		//printf("from/2=%d\n",from/2);
-		pred_glob[vloc]=VERTEX_TO_GLOBAL(from/TH_N,m->src_vloc); //update path
+		pred_glob[vloc]=VERTEX_TO_GLOBAL(from,m->src_vloc); //update path
 
 		if(lightphase && !TEST_VISITEDLOC(vloc)) //Bitmap used to track if was already relaxed with light edge
 		{
 			if(w < glob_maxdelta) { //if falls into current bucket needs further reprocessing
 				q2[__sync_fetch_and_add(&q2c,1)] = vloc;
+				//q2[q2c++]=vloc;
 				SET_VISITEDLOC(vloc);
 			}
 		}
 	}
+	pthread_mutex_unlock(&mt);
 }
 
 //Sending relaxation active message
 void send_relax(int64_t glob, float weight,int fromloc) {
+	send_time++;
+	//printf("send %d->%d:from %d->%d\n",VERTEX_TO_GLOBAL(rank,fromloc),glob,rank,VERTEX_OWNER(glob));
+	unsigned check=(*(unsigned *)&weight)^(unsigned)glob^fromloc;
 	
-	//printf("send %d->%d\n",VERTEX_TO_GLOBAL(rank,fromloc),glob);
-	relaxmsg m = {weight,VERTEX_LOCAL(glob),fromloc};
+	relaxmsg m = {weight,VERTEX_LOCAL(glob),fromloc,check};
 	pml_send(&m,1,sizeof(relaxmsg),VERTEX_OWNER(glob));
+	
 }
 int rt;
+extern unsigned long long nbytes_sent,nbytes_rcvd;
+extern double __thread starttime;
 void *entry(void *arg){
+	starttime = aml_time();
 	poll_time=0;
 	send_time=0;
+	nbytes_sent=0;
+	nbytes_rcvd=0;
 	//printf("1 %f\n",aml_time());
 	pml_init(arg);
-	unsigned int i,j;
+	unsigned int i,j,from,to;
 	long sum=0;
 	int localrank=((struct pml_thread*)arg)->rank%((struct pml_thread*)arg)->size;
-	float delta = 0.1;
+	float delta=0.1;
 	float *dist=glob_dist;
 	int64_t* pred=pred_glob;
 	int root=rt;
@@ -102,7 +121,6 @@ void *entry(void *arg){
 	sum=1;
 	int64_t lastvisited=1;
 	while(sum!=0) {
-	//printf("2 %f\n",aml_time());
 #ifdef DEBUGSTATS
 		double t0 = aml_time();
 		nbytes_sent=0;
@@ -112,8 +130,9 @@ void *entry(void *arg){
 			CLEAN_VISITED();
 			lightphase=1;
 			pml_barrier();
-			
-			for(i=0;i<qc;i++)
+			from=qc*localrank/((struct pml_thread*)arg)->size;
+			to = qc*(localrank+1)/((struct pml_thread*)arg)->size;
+			for(i=from;i<to;i++)
 				for(j=rowstarts[q1[i]];j<rowstarts[q1[i]+1];j++)
 					if(weights[j]<delta)
 						send_relax(COLUMN(j),dist[q1[i]]+weights[j],q1[i]);
@@ -129,7 +148,9 @@ void *entry(void *arg){
 
 	//printf("4 %f\n",aml_time());
 		//2. iterate over S and heavy edges
-		for(i=0;i<g.nlocalverts;i++)
+		from=g.nlocalverts*localrank/((struct pml_thread*)arg)->size;
+		to = g.nlocalverts*(localrank+1)/((struct pml_thread*)arg)->size;
+		for(i=from;i<to;i++)
 			if(dist[i]>=glob_mindelta && dist[i] < glob_maxdelta) {
 				for(j=rowstarts[i];j<rowstarts[i+1];j++)
 					if(weights[j]>=delta)
@@ -146,16 +167,19 @@ void *entry(void *arg){
 		pml_barrier();
 		//3. Bucket processing and checking termination condition
 		int64_t lvlvisited=0;
-	if(localrank==0){
-		for(i=0;i<g.nlocalverts;i++)
+	
+		from=g.nlocalverts*localrank/((struct pml_thread*)arg)->size;
+		to = g.nlocalverts*(localrank+1)/((struct pml_thread*)arg)->size;
+		for(i=from;i<to;i++)
 			if(dist[i]>=glob_mindelta) {
 				sum++; //how many are still to be processed
 				if (dist[i] < glob_maxdelta)
 					q1[__sync_fetch_and_add(&qc,1)]=i; //this is lowest bucket
 			} else if(dist[i]!=-1.0) lvlvisited++;
-	}
+	
 	
 		sum=pml_long_allsum(sum);
+	//printf("6 %f %d\n",aml_time(),thread_rank);
 #ifdef DEBUGSTATS
 		t0-=aml_time();
 		lvlvisited=pml_long_allsum(lvlvisited);
@@ -164,20 +188,28 @@ void *entry(void *arg){
 		lastvisited = lvlvisited;
 #endif
 	}
-	printf("polltime=%d send_time=%d\n",poll_time,send_time);
+//	printf("polltime=%d send_time=%d\n",poll_time,send_time);
 	return NULL;
 }
 int __pthread_num=TH_N;
 volatile extern int sync1,sync2;
 void *test(void *arg){
-	
 	//printf("1 %f\n",aml_time());
+	poll_time=0;send_time=0;
 	pml_init(arg);
 	int tosend=1;
 	if(rank==0)tosend=1;
-	else tosend=0;
-	for(int i=0;i<1138364/((struct pml_thread*)arg)->size;i++){send_relax(tosend,0.2,8);if(i%1000==0)q2c=0;}
-	for(int i=0;i<88;i++)pml_barrier();
+	else tosend=0;///((struct pml_thread*)arg)->size
+	double t0=aml_time();
+	long ifrom = 11383640*self/TH_N;
+	long ito = 11383640*(self+1)/TH_N;
+	for(long i=1;i<10;i++){send_relax(i*3%g.nglobalverts,i*5%g.nglobalverts/g.nglobalverts,i*7%g.nglobalverts);if(i%1000==0){q2c=0;
+	//printf("i=%d\n",i);
+	}}
+	for(int i=0;i<100/TH_N;i++)pml_barrier();
+	printf("end\n");
+	printf("self=%d time=%f\n",self,aml_time()-t0);
+	printf("polltime=%d send_time=%d\n",poll_time,send_time);
 	/*{while(sync2>=__pthread_num){sleep(0);};
 	int r;
 	if(__pthread_num==__sync_add_and_fetch(&sync1,1)){
@@ -195,6 +227,7 @@ void *test(void *arg){
 	return NULL;
 }
 void run_sssp(int64_t root,int64_t* pred,float *dist) {
+	//printf("root=%d\n",root);
 	rt=root;
 	glob_dist=dist;
 	pred_glob=pred;
